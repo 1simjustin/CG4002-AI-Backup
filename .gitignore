@@ -1,0 +1,4 @@
+/mqtt-certs/
+/__pycache__/
+*/__pycache__/
+/.claude/
