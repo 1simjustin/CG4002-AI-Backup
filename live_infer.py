@@ -290,6 +290,9 @@ def main():
 
         filled = min(shifu_buf.count, student_buf.count)
         print_scores(student_buf.count, filled, scores)
+        missing_limbs = [l for l in LIMB_NAMES if scores[l] < 0]
+        if missing_limbs:
+            print(f"  Missing limbs: {', '.join(missing_limbs)}")
         print(f"  seq={sequence}, latency={latency}ms")
 
         # -- Publish overall result --

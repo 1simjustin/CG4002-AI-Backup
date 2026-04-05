@@ -151,6 +151,26 @@ def window_to_limb_tensors(
     return tensors
 
 
+def detect_missing_limbs(raw_window: np.ndarray) -> dict:
+    """
+    Detect which limbs have no data (both segments all-zero across the window).
+
+    Must be called on the RAW window before normalization, since z-score
+    transforms zeros into non-zero values.
+
+    Args:
+        raw_window: (128, 48) raw sensor values.
+
+    Returns:
+        Dict mapping limb name -> bool (True if missing).
+    """
+    missing = {}
+    for limb, sl in LIMB_SLICES.items():
+        limb_data = raw_window[:, sl]           # (128, 12)
+        missing[limb] = not np.any(limb_data)   # True if all zeros
+    return missing
+
+
 # -- Inference step --------------------------------------------------------
 
 @torch.no_grad()
@@ -164,9 +184,18 @@ def run_inference(
 ) -> dict:
     """
     Extract windows from both buffers, preprocess, run model, return scores.
+
+    Limbs with missing data (both segments all-zero) in either the shifu
+    or student stream get a sentinel score of -1.0 and are excluded from
+    the overall score computation.
     """
     shifu_window = shifu_buf.get_window()
     student_window = student_buf.get_window()
+
+    # Detect missing limbs on raw windows BEFORE normalization
+    shifu_missing = detect_missing_limbs(shifu_window)
+    student_missing = detect_missing_limbs(student_window)
+    missing = {l: shifu_missing[l] or student_missing[l] for l in LIMB_NAMES}
 
     shifu_limbs = window_to_limb_tensors(shifu_window, device, global_mean, global_std)
     student_limbs = window_to_limb_tensors(student_window, device, global_mean, global_std)
@@ -177,10 +206,19 @@ def run_inference(
         model_input[f"student_{limb}"] = student_limbs[limb]
 
     output = model(**model_input)
+    limb_scores = output["limb_scores"].squeeze(0).cpu().numpy()     # (4,)
 
-    limb_scores_t = output["limb_scores"]                            # (1, 4)
-    overall_score = compute_overall_score(limb_scores_t).squeeze().cpu().item()
-    limb_scores = limb_scores_t.squeeze(0).cpu().numpy()             # (4,)
+    # Override missing limbs with sentinel and compute overall from valid only
+    for i, limb in enumerate(LIMB_NAMES):
+        if missing[limb]:
+            limb_scores[i] = -1.0
+
+    valid_indices = [i for i, l in enumerate(LIMB_NAMES) if not missing[l]]
+    if valid_indices:
+        valid_t = torch.tensor([[limb_scores[i] for i in valid_indices]])
+        overall_score = compute_overall_score(valid_t).squeeze().item()
+    else:
+        overall_score = -1.0
 
     return {
         "overall": overall_score,
@@ -191,12 +229,17 @@ def run_inference(
     }
 
 
+def _fmt_score(s: float) -> str:
+    """Format a limb/overall score, showing N/A for missing (-1)."""
+    return " N/A" if s < 0 else f"{s:.3f}"
+
+
 def print_scores(frame_idx: int, filled: int, scores: dict) -> None:
     """Pretty-print inference results."""
     print(f"  Frame {frame_idx:>4d} | buf {filled:>3d}/{WINDOW_SIZE} | "
-          f"Overall: {scores['overall']:.3f} | "
-          f"LA: {scores['left_arm']:.3f}  RA: {scores['right_arm']:.3f}  "
-          f"LL: {scores['left_leg']:.3f}  RL: {scores['right_leg']:.3f}")
+          f"Overall: {_fmt_score(scores['overall'])} | "
+          f"LA: {_fmt_score(scores['left_arm'])}  RA: {_fmt_score(scores['right_arm'])}  "
+          f"LL: {_fmt_score(scores['left_leg'])}  RL: {_fmt_score(scores['right_leg'])}")
 
 
 # -- File helpers ----------------------------------------------------------
