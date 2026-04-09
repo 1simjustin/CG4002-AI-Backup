@@ -58,8 +58,8 @@ from infer import (
 # ================= MQTT CONFIG =================
 BROKER = "54.79.62.237"
 PORT = 8883
-# CA_CERT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mqtt-certs", "ca.crt")
-CA_CERT = "/home/xilinx/mqtt-certs/ca.crt"
+CA_CERT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mqtt-certs", "ca.crt")
+# CA_CERT = "/home/xilinx/mqtt-certs/ca.crt"
 SENSOR_TOPIC = "sensor/+/aggregated"
 INFERENCE_TOPIC = "inference/result"
 

@@ -131,7 +131,7 @@ class FeatureExtractor(nn.Module):
         lstm_layers: int = 1,
         dropout: float = 0.3,
         stem_kernel_size: int = 5,
-        recency_decay: float = 0.03,
+        recency_decay: float = 0.1,
     ):
         super().__init__()
         self.embed_dim = lstm_hidden * 2  # bidirectional
@@ -215,7 +215,7 @@ LIMB_GROUP = {
 
 def compute_overall_score(
     limb_scores: torch.Tensor,
-    sharpness: float = 1.5,
+    sharpness: float = 1.1,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """
