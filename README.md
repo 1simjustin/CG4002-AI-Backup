@@ -32,30 +32,73 @@ each) capture accelerometer and gyroscope data at each timestep, producing
 48 channels of motion data. The AI compares the student's motion pattern
 against the expert's and outputs per-limb quality scores in [0, 1].
 
+The system has two views worth drawing: the **Siamese data flow** (how
+the two streams meet and produce scores) and the **FeatureExtractor
+internals** (what lives inside each `arm_extractor` / `leg_extractor`
+block).
+
+**Siamese data flow:**
+
 ```
-8 IMU sensors (48 channels)
-    │
-    ▼
-┌────────────────────────────────────────────────────────┐
-│  Normalisation: per-sample mean subtraction + z-score  │
-└────────────────┬───────────────────────────────────────┘
-                 │
-         ┌───────┴───────┐
-         ▼               ▼
-   ┌──────────┐    ┌──────────┐
-   │   Arm    │    │   Leg    │
-   │Extractor │    │Extractor │
-   │ (k=7)    │    │ (k=3)    │
-   └────┬─────┘    └────┬─────┘
-        │               │
-        ▼               ▼
-   4 limb embeddings (shifu + student)
-        │
-        ▼
-   Per-limb L2 distance → exp(-d²/τ²) → 4 scores
-        │
-        ▼
-   Overall = geometric mean × worst-limb penalty
+  Shifu (48 ch × T)                           Student (48 ch × T)
+        │                                              │
+        ▼                                              ▼
+   Normalisation                                 Normalisation
+   per-sample μ + global z-score          per-sample μ + global z-score
+        │                                              │
+   split 4 × 12 ch                              split 4 × 12 ch
+   LA   RA   LL   RL                            LA   RA   LL   RL
+    │    │    │    │                             │    │    │    │
+    ▼    ▼    ▼    ▼                             ▼    ▼    ▼    ▼
+  ┌─arm_extractor─┐ ┌─leg_extractor─┐       ┌─arm_extractor─┐ ┌─leg_extractor─┐
+  │   (shared)    │ │   (shared)    │ ◄───► │  (same weights as shifu side)  │
+  └───┬────┬──────┘ └──────┬────┬──┘       └───┬────┬──────┘ └──────┬────┬──┘
+      ▼    ▼               ▼    ▼              ▼    ▼               ▼    ▼
+    e_LA e_RA            e_LL e_RL           e_LA' e_RA'         e_LL' e_RL'
+   (shifu, 16-d each)                        (student, 16-d each)
+      │    │               │    │              │    │               │    │
+      └────┼───────────────┼────┼──── pair by limb ─┼───────────────┼────┘
+           │               │                         │               │
+           ▼               ▼                         ▼               ▼
+         d_LA            d_RA                      d_LL            d_RL
+      (‖e − e'‖₂, one scalar per limb)
+           │               │                         │               │
+       use τ_arm       use τ_arm                 use τ_leg       use τ_leg
+           ▼               ▼                         ▼               ▼
+         s_LA            s_RA                      s_LL            s_RL
+         s_i = exp(−d_i² / τ_g²)        g ∈ {arm, leg}
+                              │
+                              ▼
+           Overall = geomean(s) × exp(−1.1 × (1 − min s)²)
+```
+
+**FeatureExtractor internals** (the same block is called 4 times per
+Siamese side — twice as `arm_extractor`, twice as `leg_extractor`):
+
+```
+  FeatureExtractor  (arm_extractor or leg_extractor)
+  ──────────────────────────────────────────────────
+  Input: (B, 12, T)        12 = 2 IMU segments × 6 axes
+      │
+      ▼
+  Conv1d stem → BatchNorm → ReLU
+      in=12, out=32, kernel = 7 (arm) or 3 (leg)
+      │
+      ▼
+  2 × ResBlock1D  (channels=32, k=3, dropout=0.3)
+      each block: BN → ReLU → Conv → BN → ReLU → Dropout → Conv
+                  with skip connection (x + block(x))
+      │
+      ▼
+  Bi-LSTM  (hidden=8, 1 layer, bidirectional)
+      │
+      ▼
+  Pooling over time:
+    • training mode → GAP  (uniform mean over T frames)
+    • eval mode     → RWAP (w_t = exp(0.1 · (t − T + 1)), normalised)
+      │
+      ▼
+  Output: (B, 16)   per-limb embedding
 ```
 
 ### Why Open-Set?
