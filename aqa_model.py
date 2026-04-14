@@ -229,20 +229,21 @@ def compute_overall_score(
 
     The geometric mean already penalises low outliers more than arithmetic
     mean. The exponential penalty adds a moderate dropoff when any single
-    limb is performing badly. Sharpness=1.5 provides gentler penalisation
-    than the previous 3.0, allowing faster recovery when the student
-    returns to good form.
+    limb is performing badly. Sharpness=1.1 provides gentle penalisation,
+    allowing faster recovery when the student returns to good form
+    (previous values of 1.5 and 3.0 were too aggressive and caused overall
+    scores to stay low long after the offending limb had improved).
 
-    Examples (sharpness=1.5):
-        All 0.90 -> geo=0.900, penalty=0.985, overall=0.887
-        All 0.50 -> geo=0.500, penalty=0.687, overall=0.344
-        [0.10, 0.90, 0.90, 0.90] -> geo=0.547, penalty=0.259, overall=0.142
-        [0.90, 0.90, 0.90, 0.50] -> geo=0.796, penalty=0.687, overall=0.547
+    Examples (sharpness=1.1):
+        All 0.90 -> geo=0.900, penalty=0.989, overall=0.890
+        All 0.50 -> geo=0.500, penalty=0.757, overall=0.379
+        [0.10, 0.90, 0.90, 0.90] -> geo=0.547, penalty=0.418, overall=0.229
+        [0.90, 0.90, 0.90, 0.50] -> geo=0.796, penalty=0.757, overall=0.603
 
     Args:
         limb_scores: (..., 4) tensor of per-limb scores in [0, 1].
         sharpness: Controls how aggressively a bad limb drags the score down.
-                   Higher = steeper exponential dropoff. Default 1.5.
+                   Higher = steeper exponential dropoff. Default 1.1.
         eps: Small constant to avoid log(0).
 
     Returns:
@@ -449,7 +450,7 @@ if __name__ == "__main__":
     print(f"  temperature_leg:    {output['temperature_leg'].item():.4f}")
 
     # Demo the exponential dropoff behaviour
-    print(f"\nOverall score examples (sharpness=1.5):")
+    print(f"\nOverall score examples (sharpness=1.1):")
     test_cases = [
         [0.90, 0.90, 0.90, 0.90],
         [0.50, 0.50, 0.50, 0.50],

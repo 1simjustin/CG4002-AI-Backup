@@ -7,7 +7,7 @@ open-set — it generalises to movements never seen during training.
 
 This document details the design choices behind every component of the AI
 pipeline: data handling, model architecture, training, inference, live
-deployment, and evaluation.
+deployment, evaluation, and calibration fine-tuning.
 
 ---
 
@@ -20,6 +20,7 @@ deployment, and evaluation.
 5. [Inference — infer.py](#inference--inferpy)
 6. [Live Inference — live_infer.py](#live-inference--live_inferpy)
 7. [Evaluation — eval.py](#evaluation--evalpy)
+8. [Calibration Fine-Tuning — finetune_calibration.py](#calibration-fine-tuning--finetune_calibrationpy)
 
 ---
 
@@ -700,3 +701,136 @@ kick vs wave_hands             0.0  0.012  0.015  0.009  0.018  0.011  wave_stud
 The side-by-side ground-truth and model score columns make it easy to
 assess calibration — whether the model's output scale matches the
 intended 0-to-1 quality range.
+
+---
+
+## Calibration Fine-Tuning — finetune_calibration.py
+
+Real-world deployments eventually hit distribution shift: the IMU firmware
+changes its post-processing, the sensor hardware is swapped, or the
+mounting convention is updated. When this happens, the feature extractors
+may still produce meaningful embeddings, but the *mapping from embedding
+distance to score* is miscalibrated. `finetune_calibration.py` addresses
+this without a full retrain.
+
+### What it updates vs what it preserves
+
+| Component | Action | Reason |
+|---|---|---|
+| `arm_extractor`, `leg_extractor` | **Frozen** | The learned motion features are expensive (~35K params) and should still apply if the sensor is semantically producing the same kind of data. Preserving them keeps the open-set geometry intact. |
+| `log_temperature_arm`, `log_temperature_leg` | **Trainable** | The `exp(-d²/τ²)` mapping from distance to score is exactly what goes wrong when the distance distribution shifts. Two scalars, directly optimisable. |
+| `global_mean`, `global_std` | **Recomputed** (not trained) | If the new data has different per-channel statistics, z-scoring with old stats feeds the extractors inputs they weren't trained on. Recomputed directly from the new recordings via the same `_compute_global_stats()` used at training time. |
+
+Fitting 2 scalars + 96 normalisation values has a tiny number of degrees
+of freedom, which is exactly what's needed when calibration data is
+scarce.
+
+### Why freezing the extractors is the right default
+
+A full fine-tune with only 20-30 pairs would catastrophically overfit the
+extractors. Worse, it would drift them away from the embedding geometry
+that enables open-set generalisation — the contrastive distances that
+separate different movements would collapse as the model memorises the
+small calibration set.
+
+By freezing the extractors, we guarantee:
+
+1. The per-movement embedding structure (what makes a kick look different
+   from a wave) is preserved exactly.
+2. The mismatch/open-set boundary is preserved exactly (the feature
+   extractors produce the same relative geometry).
+3. Only the score calibration — the "dial" that converts distance to a
+   [0, 1] score — is adjusted.
+
+### Data requirements
+
+The script needs ~15–30 shifu-student pairs in the new data format,
+spanning at least two score levels (ideally all three of {0.1, 0.5, 1.0}).
+Why this matters:
+
+- **One score level only** → τ is unidentifiable. If every pair has
+  score=1.0, any τ that keeps `exp(-d²/τ²) ≈ 1` minimises the loss. The
+  script warns if it detects a single-level dataset.
+- **Extreme scores missing** → the temperature converges poorly because
+  it has no signal at the ends of the range. The script prints score
+  coverage up front so this is visible before fitting.
+- **Only one movement** → synthetic mismatch generation is disabled
+  (requires ≥2 movements for cross-movement pairs). Calibration still
+  works, but mismatch-separation sanity checks can't run.
+
+### Training-time choices
+
+**Inference-mode forward passes.** The script runs `model.eval()` during
+fitting. This matters because the `FeatureExtractor` uses GAP during
+training and RWAP during inference (`aqa_model.py:198-200`). Calibrating
+against GAP embeddings would produce a temperature that's wrong for
+deployment, which uses RWAP. Forcing eval mode ensures the temperature is
+tuned against exactly the pooling behaviour it will see in production.
+Gradients still flow through the unfrozen temperature parameters because
+`eval()` only affects BN/dropout, not autograd.
+
+**MSE loss by default, contrastive optional.** The simplest fit uses only
+`score_mse_loss` on matched pairs. This directly optimises for the
+deployment objective (predicted score matches ground-truth). A contrastive
+term is available when mismatch pairs are present (`--contrastive_weight`,
+`--negative_pair_prob`), which helps preserve the open-set boundary when
+the temperature shift is large.
+
+**High learning rate.** Default `lr=0.05` — far higher than training
+(1e-3). With only 2 trainable parameters in a well-conditioned loss
+landscape, aggressive steps converge in ~100 iterations without
+instability.
+
+**No augmentation, no pseudo-shifu.** The calibration set is small and
+clean signal is what we want. Augmentation would inject noise into an
+already data-starved fit, and pseudo-shifu expansion would artificially
+inflate the pair count with correlated samples that don't add information.
+
+### Diagnostics
+
+The script prints four diagnostic tables, pre- and post-fit:
+
+1. **Embedding distance table** (per-limb, grouped by GT score). This is
+   the most informative diagnostic: if score=0.1 pairs already have
+   visibly larger distances than score=1.0 pairs, the extractors are
+   still discriminating correctly and τ fitting will work. If the
+   distance distributions overlap heavily, no temperature can rescue
+   them — the extractors need retraining.
+
+2. **Predicted score distribution** (mean, std, range per GT bucket).
+   Pre-fit shows the symptom; post-fit shows the fix.
+
+3. **Sanity checks** — monotonic score ordering (GT=1.0 predicts higher
+   than GT=0.5, which predicts higher than GT=0.1), mismatch separation
+   (mismatch pairs score <0.2), and score range spread (>0.3). Each
+   failure includes a pointer to likely root cause.
+
+4. **Temperature trajectory.** Printed every N steps during fitting.
+   Healthy convergence looks like rapid movement in the first ~30 steps
+   followed by stable oscillation around a fixed point. Monotonic drift
+   without settling indicates either too few samples or a failure mode
+   that τ alone can't fix.
+
+### Checkpoint compatibility
+
+The output checkpoint has the same structure as one produced by `train.py`
+so it can be consumed by `live_infer.py`, `infer.py`, and `eval.py`
+without code changes. A `finetune` provenance dict is added (source
+checkpoint, recordings dir, old/new τ values) so you can trace the lineage
+of deployed models.
+
+### When this approach isn't enough
+
+If the post-fit sanity checks fail — specifically if score ordering is
+violated — the feature extractors themselves have drifted too far from
+the new data distribution. Temperature-only fine-tuning cannot fix this.
+The remedies, in increasing order of effort:
+
+1. **Synthesise old-format artifacts from the new data** if you have
+   access to orientation estimates (e.g. from AHRS quaternions). This
+   transforms new-format data back into the distribution the extractors
+   were trained on.
+2. **Collect more calibration data and unfreeze the last few layers** of
+   each extractor for a larger fine-tune.
+3. **Full retrain** with the new data format, possibly with domain
+   randomisation to prevent the same drift in future.
