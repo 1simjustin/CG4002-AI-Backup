@@ -861,19 +861,3 @@ so it can be consumed by `live_infer.py`, `infer.py`, and `eval.py`
 without code changes. A `finetune` provenance dict is added (source
 checkpoint, recordings dir, old/new τ values) so you can trace the lineage
 of deployed models.
-
-### When this approach isn't enough
-
-If the post-fit sanity checks fail — specifically if score ordering is
-violated — the feature extractors themselves have drifted too far from
-the new data distribution. Temperature-only fine-tuning cannot fix this.
-The remedies, in increasing order of effort:
-
-1. **Synthesise old-format artifacts from the new data** if you have
-   access to orientation estimates (e.g. from AHRS quaternions). This
-   transforms new-format data back into the distribution the extractors
-   were trained on.
-2. **Collect more calibration data and unfreeze the last few layers** of
-   each extractor for a larger fine-tune.
-3. **Full retrain** with the new data format, possibly with domain
-   randomisation to prevent the same drift in future.
