@@ -39,6 +39,7 @@ import json
 import os
 import ssl
 import sys
+import threading
 import time
 from collections import deque
 from datetime import datetime
@@ -235,6 +236,24 @@ def main():
     student_buf = SlidingWindowBuffer()
     frames_since_last = [0]  # mutable for closure access
     last_sequence = [0]
+    last_shifu_ts = [None]
+    last_student_ts = [None]
+
+    # -- Inference worker (single-slot replace-on-arrival mailbox) --
+    # Inference runs on its own thread so the MQTT network loop never blocks.
+    # Only the most recent pending job is kept; older ones are silently
+    # dropped so lag can't accumulate under load.
+    job_cond = threading.Condition()
+    latest_job = [None]
+    stop_flag = [False]
+    dropped_count = [0]
+
+    class _FrozenBuffer:
+        __slots__ = ("_window",)
+        def __init__(self, window):
+            self._window = window
+        def get_window(self):
+            return self._window
 
     # -- MQTT callbacks --
     def on_connect(client, userdata, flags, rc):
@@ -250,6 +269,7 @@ def main():
         player = msg.topic.split("/")[1]
         payload = json.loads(msg.payload.decode())
         sequence = payload.get("sequence", 0)
+        start_ts = payload.get("start_ts")
         nodes = payload.get("nodes", {})
 
         frame = parse_frame(nodes)
@@ -257,6 +277,7 @@ def main():
         # -- Accumulate shifu frames --
         if player == "shifu":
             shifu_buf.push(frame)
+            last_shifu_ts[0] = start_ts
             if recorder is not None:
                 recorder.record_shifu(frame)
             return
@@ -266,6 +287,7 @@ def main():
 
         # -- Accumulate student frames --
         student_buf.push(frame)
+        last_student_ts[0] = start_ts
         if recorder is not None:
             recorder.record_student(frame)
         last_sequence[0] = sequence
@@ -282,36 +304,62 @@ def main():
 
         frames_since_last[0] = 0
 
-        # -- Run inference --
+        # -- Snapshot state and hand off to worker thread --
+        ts_candidates = [t for t in (last_shifu_ts[0], last_student_ts[0]) if t is not None]
+        earliest_start_ts = min(ts_candidates) if ts_candidates else None
+
+        new_job = {
+            "shifu_window":   shifu_buf.get_window(),
+            "student_window": student_buf.get_window(),
+            "sequence":       sequence,
+            "start_ts":       earliest_start_ts,
+            "filled":         min(shifu_buf.count, student_buf.count),
+            "student_count":  student_buf.count,
+        }
+        with job_cond:
+            if latest_job[0] is not None:
+                dropped_count[0] += 1
+            latest_job[0] = new_job
+            job_cond.notify()
+
+    # -- Inference worker thread body --
+    limb_to_nodes = {
+        "left_arm":  ["left_arm_upper_arm", "left_arm_forearm"],
+        "right_arm": ["right_arm_upper_arm", "right_arm_forearm"],
+        "left_leg":  ["left_leg_thigh", "left_leg_shin"],
+        "right_leg": ["right_leg_thigh", "right_leg_shin"],
+    }
+
+    def _run_and_publish(job, client):
         t0 = time.time()
-        scores = run_inference(model, shifu_buf, student_buf, device,
-                               global_mean, global_std)
+        scores = run_inference(
+            model,
+            _FrozenBuffer(job["shifu_window"]),
+            _FrozenBuffer(job["student_window"]),
+            device, global_mean, global_std,
+        )
         latency = int((time.time() - t0) * 1000)
 
-        filled = min(shifu_buf.count, student_buf.count)
-        print_scores(student_buf.count, filled, scores)
+        print_scores(job["student_count"], job["filled"], scores)
         missing_limbs = [l for l in LIMB_NAMES if scores[l] < 0]
         if missing_limbs:
             print(f"  Missing limbs: {', '.join(missing_limbs)}")
-        print(f"  seq={sequence}, latency={latency}ms")
+        dropped_note = f", dropped={dropped_count[0]}" if dropped_count[0] else ""
+        print(f"  seq={job['sequence']}, start_ts={job['start_ts']}, "
+              f"latency={latency}ms{dropped_note}")
 
         # -- Publish overall result --
         # Map 4 limb scores to 8-node naming convention (each limb's
         # 2 nodes share the same score since the model operates per-limb)
         part_scores = {}
-        limb_to_nodes = {
-            "left_arm":  ["left_arm_upper_arm", "left_arm_forearm"],
-            "right_arm": ["right_arm_upper_arm", "right_arm_forearm"],
-            "left_leg":  ["left_leg_thigh", "left_leg_shin"],
-            "right_leg": ["right_leg_thigh", "right_leg_shin"],
-        }
         for limb in LIMB_NAMES:
             limb_score = round(float(scores[limb]), 3)
             for node_name in limb_to_nodes[limb]:
                 part_scores[node_name] = limb_score
 
         response = {
-            "seq": sequence,
+            "seq": job["sequence"],
+            "start_ts": job["start_ts"],
             "scores": {
                 "overall": round(float(scores["overall"]), 3),
                 "part": part_scores,
@@ -321,11 +369,25 @@ def main():
 
         # -- Publish per-limb results --
         for limb in LIMB_NAMES:
-            payload = {"seq": sequence}
+            payload = {"seq": job["sequence"], "start_ts": job["start_ts"]}
             for node_name in limb_to_nodes[limb]:
                 payload[node_name] = round(float(scores[limb]), 3)
             topic = f"inference/student/{limb}"
             client.publish(topic, json.dumps(payload), qos=0)
+
+    def worker(client):
+        while not stop_flag[0]:
+            with job_cond:
+                while latest_job[0] is None and not stop_flag[0]:
+                    job_cond.wait()
+                if stop_flag[0]:
+                    return
+                job = latest_job[0]
+                latest_job[0] = None
+            try:
+                _run_and_publish(job, client)
+            except Exception as e:
+                print(f"Inference worker error: {e}")
 
     # -- Connect and run --
     client = mqtt.Client(clean_session=True)
@@ -341,6 +403,10 @@ def main():
     client.on_connect = on_connect
     client.on_message = on_message
 
+    worker_thread = threading.Thread(target=worker, args=(client,),
+                                     name="inference-worker", daemon=True)
+    worker_thread.start()
+
     print(f"Connecting to MQTT broker at {args.broker}:{args.port}...")
     try:
         client.connect(args.broker, args.port)
@@ -348,6 +414,10 @@ def main():
     except KeyboardInterrupt:
         print("\nStopped by user.")
     finally:
+        stop_flag[0] = True
+        with job_cond:
+            job_cond.notify_all()
+        worker_thread.join(timeout=2.0)
         client.disconnect()
         if recorder is not None:
             recorder.close()
