@@ -12,22 +12,27 @@ Architecture
 Two specialised FeatureExtractors with independent weights:
 
     arm_extractor  (for left_arm, right_arm):
-        Conv1d stem (kernel=7) -> 2x ResBlock1D -> Bi-LSTM -> GAP
+        Conv1d stem (kernel=7) -> 1x ResBlock1D -> Dilated Temporal Conv -> GAP
         Wider stem kernel captures broader, sweeping upper-body motions
         (e.g. wave, push, hug).
 
     leg_extractor  (for left_leg, right_leg):
-        Conv1d stem (kernel=3) -> 2x ResBlock1D -> Bi-LSTM -> GAP
+        Conv1d stem (kernel=3) -> 1x ResBlock1D -> Dilated Temporal Conv -> GAP
         Narrower stem kernel is tuned for fast, sharp lower-body
         dynamics (e.g. kick, step, stance).
 
-    Both extractors share the same ResBlock1D / LSTM topology but
-    learn completely independent weights.
+    Both extractors share the same topology but learn independent weights.
+
+    The temporal aggregator is a stack of two dilated 1D convolutions
+    (dilations 1 and 2, kernel 3) instead of a Bi-LSTM. Convs parallelise
+    across time, which gives a large speedup on CPU inference where the
+    sequential LSTM was the dominant latency cost. Receptive field is
+    comparable to what the tiny Bi-LSTM effectively used.
 
     Input per limb:  (batch, 12, seq_len)
         12 = 2 segments x 6 axes (ax, ay, az, gx, gy, gz)
     Output per limb: (batch, embed_dim)
-        embed_dim = lstm_hidden * 2 (bidirectional)
+        embed_dim defaults to 16
 
 Scoring pipeline:
     1. Extract 8 embeddings (4 shifu + 4 student) using the appropriate
@@ -88,20 +93,27 @@ class ResBlock1D(nn.Module):
 
 class FeatureExtractor(nn.Module):
     """
-    1D-ResNet + Bi-LSTM + pooling (GAP for training, RWAP for inference).
+    1D-ResNet + Dilated Temporal Conv + pooling (GAP for training, RWAP
+    for inference).
 
     Processes a single limb's IMU tensor (2 segments x 6 axes = 12 channels)
     into a fixed-size embedding vector for similarity comparison.
 
     Pipeline:
-        Conv1d stem (12 -> conv_channels) -> N x ResBlock1D -> Bi-LSTM -> Pooling
+        Conv1d stem (12 -> conv_channels) -> N x ResBlock1D
+        -> Dilated Temporal Conv (2 layers, dilations 1 and 2) -> Pooling
 
     The stem_kernel_size parameter controls the initial receptive field,
     allowing arm vs leg extractors to capture different motion profiles:
         - Wider kernel (7): captures broader temporal patterns (arms)
         - Narrower kernel (3): captures sharp, fast dynamics (legs)
 
-    The Bi-LSTM captures temporal dependencies in both directions.
+    The dilated conv block captures medium-range temporal dependencies
+    (receptive field ~7 timesteps) and replaces the previous Bi-LSTM. It
+    is fully parallel across time, which makes CPU inference several
+    times faster -- 8 extractor forwards run per inference step in the
+    live MQTT pipeline, and the Bi-LSTM's sequential loop over 128
+    frames was the dominant latency cost.
 
     Pooling strategy:
         - **Training** (self.training=True): flat Global Average Pooling (GAP).
@@ -125,16 +137,22 @@ class FeatureExtractor(nn.Module):
     def __init__(
         self,
         in_channels: int = 12,
-        conv_channels: int = 32,
-        num_res_blocks: int = 2,
-        lstm_hidden: int = 32,
-        lstm_layers: int = 1,
+        conv_channels: int = 20,
+        num_res_blocks: int = 1,
+        embed_dim: int = 16,
         dropout: float = 0.3,
         stem_kernel_size: int = 5,
         recency_decay: float = 0.1,
+        # Deprecated: kept for backward-compat with callers that still pass
+        # lstm_hidden/lstm_layers. If lstm_hidden is given, embed_dim is
+        # inferred as lstm_hidden * 2 (matching old bidirectional shape).
+        lstm_hidden: int = None,
+        lstm_layers: int = None,
     ):
         super().__init__()
-        self.embed_dim = lstm_hidden * 2  # bidirectional
+        if lstm_hidden is not None:
+            embed_dim = lstm_hidden * 2
+        self.embed_dim = embed_dim
         self.recency_decay = recency_decay
 
         self.stem = nn.Sequential(
@@ -148,13 +166,19 @@ class FeatureExtractor(nn.Module):
             *[ResBlock1D(conv_channels, dropout=dropout) for _ in range(num_res_blocks)]
         )
 
-        self.lstm = nn.LSTM(
-            input_size=conv_channels,
-            hidden_size=lstm_hidden,
-            num_layers=lstm_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=dropout if lstm_layers > 1 else 0.0,
+        # Dilated temporal conv block (replaces Bi-LSTM).
+        # Two Conv1d layers with dilations 1 and 2, kernel=3 -> receptive
+        # field of 7 timesteps. Fully parallel over the time axis, so this
+        # is much cheaper than an LSTM on CPU.
+        self.temporal = nn.Sequential(
+            nn.Conv1d(conv_channels, embed_dim, kernel_size=3,
+                      padding=1, dilation=1),
+            nn.BatchNorm1d(embed_dim),
+            nn.ReLU(),
+            nn.Conv1d(embed_dim, embed_dim, kernel_size=3,
+                      padding=2, dilation=2),
+            nn.BatchNorm1d(embed_dim),
+            nn.ReLU(),
         )
 
         self.dropout = nn.Dropout(dropout)
@@ -191,8 +215,8 @@ class FeatureExtractor(nn.Module):
         """
         h = self.stem(x)          # (B, conv_ch, seq)
         h = self.res_blocks(h)    # (B, conv_ch, seq)
-        h = h.transpose(1, 2)     # (B, seq, conv_ch)
-        h, _ = self.lstm(h)       # (B, seq, embed_dim)
+        h = self.temporal(h)      # (B, embed_dim, seq)
+        h = h.transpose(1, 2)     # (B, seq, embed_dim)
         h = self.dropout(h)
 
         if self.training:
@@ -278,10 +302,9 @@ class AQAModel(nn.Module):
     def __init__(
         self,
         in_channels: int = 12,
-        conv_channels: int = 32,
-        num_res_blocks: int = 2,
-        lstm_hidden: int = 8,
-        lstm_layers: int = 1,
+        conv_channels: int = 20,
+        num_res_blocks: int = 1,
+        embed_dim: int = 16,
         dropout: float = 0.3,
         init_temperature: float = 1.5,
     ):
@@ -292,8 +315,7 @@ class AQAModel(nn.Module):
             in_channels=in_channels,
             conv_channels=conv_channels,
             num_res_blocks=num_res_blocks,
-            lstm_hidden=lstm_hidden,
-            lstm_layers=lstm_layers,
+            embed_dim=embed_dim,
             dropout=dropout,
             stem_kernel_size=7,
         )
@@ -303,8 +325,7 @@ class AQAModel(nn.Module):
             in_channels=in_channels,
             conv_channels=conv_channels,
             num_res_blocks=num_res_blocks,
-            lstm_hidden=lstm_hidden,
-            lstm_layers=lstm_layers,
+            embed_dim=embed_dim,
             dropout=dropout,
             stem_kernel_size=3,
         )
