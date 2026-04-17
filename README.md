@@ -26,6 +26,11 @@ deployment, evaluation, and calibration fine-tuning.
 
 ## System Overview
 
+> **Note:** This model serves as a software backup to the hardware AI
+> component. If the hardware AI (running on the Ultra96 FPGA) is
+> unavailable or produces invalid results, this software implementation
+> takes over inference to ensure continuous operation.
+
 The system assesses how well a student performs a martial arts movement
 compared to an expert ("shifu"). Eight IMU sensors (4 limbs x 2 segments
 each) capture accelerometer and gyroscope data at each timestep, producing
