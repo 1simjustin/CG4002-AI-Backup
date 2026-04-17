@@ -324,7 +324,7 @@ def main():
     p.add_argument("--student_csv", type=str, required=True,
                    help="Path to student CSV")
     p.add_argument("--checkpoint", type=str,
-                   default=os.path.join(os.path.dirname(__file__), "checkpoints", "best_slim_model.pt"),
+                   default=os.path.join(os.path.dirname(__file__), "checkpoints", "best_original_model.pt"),
                    help="Path to saved model checkpoint")
     p.add_argument("--step_size", type=int, default=10,
                    help="Frames between inference steps")

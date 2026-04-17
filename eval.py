@@ -18,7 +18,7 @@ are high, the model is not discriminating between movement types.
 
 Usage:
     python eval.py
-    python eval.py --checkpoint checkpoints/best_model.pt
+    python eval.py --checkpoint checkpoints/best_original_model.pt
     python eval.py --mismatches          # include cross-movement comparisons
     python eval.py --csv results.csv     # also save to CSV
 """
@@ -104,7 +104,7 @@ def main():
     p.add_argument("--recordings_dir", type=str,
                    default=os.path.join(os.path.dirname(__file__), "recordings"))
     p.add_argument("--checkpoint", type=str,
-                   default=os.path.join(os.path.dirname(__file__), "checkpoints", "best_slim_model.pt"))
+                   default=os.path.join(os.path.dirname(__file__), "checkpoints", "best_original_model.pt"))
     p.add_argument("--model_type", type=str, default="auto",
                    choices=["auto", "slim", "original"],
                    help="Architecture variant. 'auto' detects from checkpoint keys.")
