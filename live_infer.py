@@ -188,7 +188,7 @@ class StreamRecorder:
 def main():
     p = argparse.ArgumentParser(description="Live AQA inference via MQTT")
     p.add_argument("--checkpoint", type=str,
-                   default=os.path.join(os.path.dirname(__file__), "checkpoints", "best_model.pt"),
+                   default=os.path.join(os.path.dirname(__file__), "checkpoints", "best_slim_model.pt"),
                    help="Path to saved model checkpoint")
     p.add_argument("--step_size", type=int, default=10,
                    help="Student frames between inference steps")
@@ -205,6 +205,11 @@ def main():
                    help="MQTT broker port")
     p.add_argument("--ca_cert", type=str, default=CA_CERT,
                    help="Path to CA certificate for TLS")
+    p.add_argument("--model_type", type=str, default="auto",
+                   choices=["auto", "slim", "original"],
+                   help="Architecture variant to load. 'auto' detects from "
+                        "checkpoint keys (default). 'slim' = dilated-conv "
+                        "temporal block; 'original' = Bi-LSTM.")
     args = p.parse_args()
 
     if not os.path.isfile(args.checkpoint):
@@ -218,7 +223,8 @@ def main():
     print(f"Device: {device}")
 
     # -- Load model --
-    model, checkpoint, global_mean, global_std = load_model(args.checkpoint, device)
+    model, checkpoint, global_mean, global_std = load_model(
+        args.checkpoint, device, args.model_type)
     val_metric = checkpoint.get("val_loss", checkpoint.get("val_mae", None))
     metric_name = "val_loss" if "val_loss" in checkpoint else "val_mae"
     print(f"Model loaded (trained epoch {checkpoint['epoch']}, "

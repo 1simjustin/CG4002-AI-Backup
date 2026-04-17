@@ -37,7 +37,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from aqa_model import AQAModel, LIMB_NAMES, compute_overall_score
+from aqa_model import AQAModel, LIMB_NAMES, MODEL_CONFIGS, compute_overall_score, detect_model_type
 
 # Must match training max_seq_len
 WINDOW_SIZE = 128
@@ -254,7 +254,7 @@ def load_sensor_columns(csv_path: str) -> np.ndarray:
     return df.values.astype(np.float32)
 
 
-def load_model(checkpoint_path, device):
+def load_model(checkpoint_path, device, model_type="auto"):
     """
     Load model and normalisation stats from a training checkpoint.
 
@@ -265,19 +265,49 @@ def load_model(checkpoint_path, device):
           computed from the training set after per-sample mean subtraction.
         - args: training hyperparameters for reproducibility.
 
+    Args:
+        checkpoint_path: Path to a .pt checkpoint file.
+        device: torch.device to load weights onto.
+        model_type: Which architecture to instantiate.
+            'auto'     -- detect automatically from checkpoint state-dict keys
+                          (arm_extractor.lstm.* -> 'original',
+                           arm_extractor.temporal.* -> 'slim').
+            'slim'     -- dilated-conv temporal aggregator (slim-model branch).
+            'original' -- Bi-LSTM temporal aggregator (masking branch).
+
     Uses strict=False to allow loading old checkpoints that may have a
     different key layout (e.g. single shared extractor, global temperature).
     """
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    model = AQAModel()
-    missing, unexpected = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    if model_type == "auto":
+        model_type = detect_model_type(checkpoint["model_state_dict"])
+        print(f"Auto-detected model type: '{model_type}'")
+
+    if model_type not in MODEL_CONFIGS:
+        raise ValueError(f"Unknown model_type '{model_type}'. "
+                         f"Choose from: {list(MODEL_CONFIGS)}")
+
+    model = AQAModel(**MODEL_CONFIGS[model_type])
+    try:
+        missing, unexpected = model.load_state_dict(
+            checkpoint["model_state_dict"], strict=False)
+    except RuntimeError as exc:
+        # Shape mismatches happen when the wrong model_type is forced
+        # (e.g. --model_type original on a slim checkpoint).
+        raise RuntimeError(
+            f"Shape mismatch loading '{model_type}' architecture from "
+            f"'{checkpoint_path}'. The checkpoint was likely saved with a "
+            f"different architecture. Try --model_type auto to detect "
+            f"automatically.\n\nOriginal error: {exc}"
+        ) from None
     if missing:
         print(f"Note: Using defaults for missing keys: {missing}")
     if unexpected:
         print(f"Note: Ignoring unexpected keys from old checkpoint: {unexpected}")
     model.to(device)
     model.eval()
+    print(f"Model type: '{model_type}'")
 
     global_mean = checkpoint.get("global_mean", None)
     global_std = checkpoint.get("global_std", None)
@@ -294,12 +324,17 @@ def main():
     p.add_argument("--student_csv", type=str, required=True,
                    help="Path to student CSV")
     p.add_argument("--checkpoint", type=str,
-                   default=os.path.join(os.path.dirname(__file__), "checkpoints", "best_model.pt"),
+                   default=os.path.join(os.path.dirname(__file__), "checkpoints", "best_slim_model.pt"),
                    help="Path to saved model checkpoint")
     p.add_argument("--step_size", type=int, default=10,
                    help="Frames between inference steps")
     p.add_argument("--device", type=str, default="auto",
                    help="'cpu', 'cuda', or 'auto'")
+    p.add_argument("--model_type", type=str, default="auto",
+                   choices=["auto", "slim", "original"],
+                   help="Architecture variant to load. 'auto' detects from "
+                        "checkpoint keys (default). 'slim' = dilated-conv "
+                        "temporal block; 'original' = Bi-LSTM.")
     args = p.parse_args()
 
     if not os.path.isfile(args.shifu_csv):
@@ -315,7 +350,8 @@ def main():
         device = torch.device(args.device)
     print(f"Device: {device}")
 
-    model, checkpoint, global_mean, global_std = load_model(args.checkpoint, device)
+    model, checkpoint, global_mean, global_std = load_model(
+        args.checkpoint, device, args.model_type)
     val_metric = checkpoint.get('val_loss', checkpoint.get('val_mae', None))
     metric_name = 'val_loss' if 'val_loss' in checkpoint else 'val_mae'
     print(f"Model loaded (trained epoch {checkpoint['epoch']}, "

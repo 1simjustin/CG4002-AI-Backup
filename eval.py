@@ -31,8 +31,8 @@ import sys
 import numpy as np
 import torch
 
-from aqa_model import AQAModel, LIMB_NAMES, compute_overall_score
-from infer import load_sensor_columns, SlidingWindowBuffer, run_inference
+from aqa_model import LIMB_NAMES, compute_overall_score
+from infer import load_model, load_sensor_columns, SlidingWindowBuffer, run_inference
 
 
 def build_test_pairs(labels_path, include_mismatches=False):
@@ -104,7 +104,10 @@ def main():
     p.add_argument("--recordings_dir", type=str,
                    default=os.path.join(os.path.dirname(__file__), "recordings"))
     p.add_argument("--checkpoint", type=str,
-                   default=os.path.join(os.path.dirname(__file__), "checkpoints", "best_model.pt"))
+                   default=os.path.join(os.path.dirname(__file__), "checkpoints", "best_slim_model.pt"))
+    p.add_argument("--model_type", type=str, default="auto",
+                   choices=["auto", "slim", "original"],
+                   help="Architecture variant. 'auto' detects from checkpoint keys.")
     p.add_argument("--mismatches", action="store_true",
                    help="Include cross-movement mismatch comparisons")
     p.add_argument("--csv", type=str, default=None,
@@ -119,25 +122,14 @@ def main():
 
     # Load model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model = AQAModel()
-    missing, unexpected = model.load_state_dict(
-        checkpoint["model_state_dict"], strict=False,
-    )
-    if missing:
-        print(f"Note: Using defaults for missing keys: {missing}")
-    if unexpected:
-        print(f"Note: Ignoring unexpected keys from old checkpoint: {unexpected}")
-    model.to(device)
-    model.eval()
+    model, checkpoint, global_mean, global_std = load_model(
+        args.checkpoint, device, args.model_type)
 
     val_metric = checkpoint.get("val_loss", checkpoint.get("val_mae", None))
     metric_name = "val_loss" if "val_loss" in checkpoint else "val_mae"
     print(f"Model: epoch {checkpoint['epoch']}, {metric_name} {val_metric:.4f}")
     print(f"Checkpoint: {args.checkpoint}")
 
-    global_mean = checkpoint.get("global_mean", None)
-    global_std = checkpoint.get("global_std", None)
     if global_mean is not None:
         print("Normalisation stats loaded from checkpoint\n")
     else:

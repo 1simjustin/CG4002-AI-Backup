@@ -59,7 +59,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 from aqa_dataset import AQADataset, aqa_collate_fn
-from aqa_model import AQAModel, LIMB_NAMES
+from aqa_model import AQAModel, LIMB_NAMES, MODEL_CONFIGS
 
 LIMB_KEYS = [
     "shifu_left_arm", "shifu_right_arm", "shifu_left_leg", "shifu_right_leg",
@@ -280,6 +280,12 @@ def parse_args():
     p.add_argument("--val_split", type=float, default=0.2)
     p.add_argument("--patience", type=int, default=15)
     p.add_argument("--seed", type=int, default=42)
+
+    # Architecture
+    p.add_argument("--model_type", type=str, default="original",
+                   choices=list(MODEL_CONFIGS),
+                   help="Architecture variant to train. "
+                        f"Choices: {list(MODEL_CONFIGS)}. Default: original.")
     return p.parse_args()
 
 
@@ -447,10 +453,11 @@ def main():
     print(f"Dataset: {n_total} total | {n_total - n_val} train | {n_val} val")
 
     # -- Model / Optimizer / Scheduler --
-    model = AQAModel().to(device)
+    model = AQAModel(**MODEL_CONFIGS[args.model_type]).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     arm_params = sum(p.numel() for p in model.arm_extractor.parameters())
     leg_params = sum(p.numel() for p in model.leg_extractor.parameters())
+    print(f"Architecture: {args.model_type}")
     print(f"Parameters: {total_params:,} (arm: {arm_params:,}, leg: {leg_params:,})")
 
     optimizer = torch.optim.AdamW(
@@ -488,15 +495,17 @@ def main():
         if is_best:
             best_val_loss = vm["loss"]
             best_epoch = epoch
+            save_path = os.path.join(args.save_dir, f"best_{args.model_type}_model.pt")
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_loss": best_val_loss,
                 "args": vars(args),
+                "model_type": args.model_type,
                 "global_mean": train_ds.global_mean,
                 "global_std": train_ds.global_std,
-            }, os.path.join(args.save_dir, "best_model.pt"))
+            }, save_path)
 
         mark = " *" if is_best else ""
         print(f"{epoch:4d}  {tm['loss']:8.4f}  {tm['cont_loss']:8.4f}  {tm['score_loss']:8.4f}  {tm['bank_loss']:8.4f}  "
@@ -507,7 +516,7 @@ def main():
     print(f"Best val loss: {best_val_loss:.4f} at epoch {best_epoch}")
     print(f"Final temperatures: tau_arm={model.temperature_arm.item():.4f}, "
           f"tau_leg={model.temperature_leg.item():.4f}")
-    print(f"Saved: {os.path.join(args.save_dir, 'best_model.pt')}")
+    print(f"Saved: {os.path.join(args.save_dir, f'best_{args.model_type}_model.pt')}")
 
 
 if __name__ == "__main__":

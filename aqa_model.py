@@ -143,17 +143,19 @@ class FeatureExtractor(nn.Module):
         dropout: float = 0.3,
         stem_kernel_size: int = 5,
         recency_decay: float = 0.1,
+        temporal_type: str = "conv",
         # Deprecated: kept for backward-compat with callers that still pass
         # lstm_hidden/lstm_layers. If lstm_hidden is given, embed_dim is
         # inferred as lstm_hidden * 2 (matching old bidirectional shape).
         lstm_hidden: int = None,
-        lstm_layers: int = None,
+        lstm_layers: int = 1,
     ):
         super().__init__()
         if lstm_hidden is not None:
             embed_dim = lstm_hidden * 2
         self.embed_dim = embed_dim
         self.recency_decay = recency_decay
+        self.temporal_type = temporal_type
 
         self.stem = nn.Sequential(
             nn.Conv1d(in_channels, conv_channels, kernel_size=stem_kernel_size,
@@ -166,20 +168,32 @@ class FeatureExtractor(nn.Module):
             *[ResBlock1D(conv_channels, dropout=dropout) for _ in range(num_res_blocks)]
         )
 
-        # Dilated temporal conv block (replaces Bi-LSTM).
-        # Two Conv1d layers with dilations 1 and 2, kernel=3 -> receptive
-        # field of 7 timesteps. Fully parallel over the time axis, so this
-        # is much cheaper than an LSTM on CPU.
-        self.temporal = nn.Sequential(
-            nn.Conv1d(conv_channels, embed_dim, kernel_size=3,
-                      padding=1, dilation=1),
-            nn.BatchNorm1d(embed_dim),
-            nn.ReLU(),
-            nn.Conv1d(embed_dim, embed_dim, kernel_size=3,
-                      padding=2, dilation=2),
-            nn.BatchNorm1d(embed_dim),
-            nn.ReLU(),
-        )
+        if temporal_type == "lstm":
+            # Bi-LSTM temporal aggregator (original architecture).
+            # Sequential over time -- higher quality but slower on CPU.
+            self.lstm = nn.LSTM(
+                input_size=conv_channels,
+                hidden_size=embed_dim // 2,  # bidirectional doubles back to embed_dim
+                num_layers=lstm_layers,
+                batch_first=True,
+                bidirectional=True,
+                dropout=dropout if lstm_layers > 1 else 0.0,
+            )
+        else:
+            # Dilated temporal conv block (slim architecture).
+            # Two Conv1d layers with dilations 1 and 2, kernel=3 -> receptive
+            # field of 7 timesteps. Fully parallel over the time axis, so this
+            # is much cheaper than an LSTM on CPU.
+            self.temporal = nn.Sequential(
+                nn.Conv1d(conv_channels, embed_dim, kernel_size=3,
+                          padding=1, dilation=1),
+                nn.BatchNorm1d(embed_dim),
+                nn.ReLU(),
+                nn.Conv1d(embed_dim, embed_dim, kernel_size=3,
+                          padding=2, dilation=2),
+                nn.BatchNorm1d(embed_dim),
+                nn.ReLU(),
+            )
 
         self.dropout = nn.Dropout(dropout)
 
@@ -188,7 +202,7 @@ class FeatureExtractor(nn.Module):
         Exponentially-weighted mean over the sequence dimension.
 
         Args:
-            h: (B, T, D) -- LSTM output sequence.
+            h: (B, T, D) -- temporal aggregator output sequence.
 
         Returns:
             (B, D) -- weighted embedding favouring recent frames.
@@ -215,13 +229,52 @@ class FeatureExtractor(nn.Module):
         """
         h = self.stem(x)          # (B, conv_ch, seq)
         h = self.res_blocks(h)    # (B, conv_ch, seq)
-        h = self.temporal(h)      # (B, embed_dim, seq)
-        h = h.transpose(1, 2)     # (B, seq, embed_dim)
+        if self.temporal_type == "lstm":
+            h = h.transpose(1, 2)     # (B, seq, conv_ch)
+            h, _ = self.lstm(h)       # (B, seq, embed_dim)
+        else:
+            h = self.temporal(h)      # (B, embed_dim, seq)
+            h = h.transpose(1, 2)     # (B, seq, embed_dim)
         h = self.dropout(h)
 
         if self.training:
             return h.mean(dim=1)                   # GAP -> stable embeddings
         return self._recency_weighted_mean(h)      # RWAP -> fast recovery
+
+
+# -- Architecture configs & detection ------------------------------------
+
+MODEL_CONFIGS = {
+    "slim": dict(
+        conv_channels=20,
+        num_res_blocks=1,
+        embed_dim=16,
+        temporal_type="conv",
+    ),
+    "original": dict(
+        conv_channels=32,
+        num_res_blocks=2,
+        embed_dim=16,
+        temporal_type="lstm",
+    ),
+}
+
+
+def detect_model_type(state_dict: dict) -> str:
+    """
+    Infer the architecture variant from checkpoint state-dict key names.
+
+    The two architectures have mutually exclusive key patterns:
+        "original": arm_extractor.lstm.weight_ih_l0, ...
+        "slim":     arm_extractor.temporal.0.weight, ...
+
+    Returns 'original' or 'slim'. Falls back to 'slim' (current default)
+    if neither pattern is found (e.g. very old checkpoints).
+    """
+    keys = state_dict.keys()
+    if any("arm_extractor.lstm" in k for k in keys):
+        return "original"
+    return "slim"
 
 
 # -- Main Model -----------------------------------------------------------
@@ -307,6 +360,7 @@ class AQAModel(nn.Module):
         embed_dim: int = 16,
         dropout: float = 0.3,
         init_temperature: float = 1.5,
+        temporal_type: str = "conv",
     ):
         super().__init__()
 
@@ -318,6 +372,7 @@ class AQAModel(nn.Module):
             embed_dim=embed_dim,
             dropout=dropout,
             stem_kernel_size=7,
+            temporal_type=temporal_type,
         )
 
         # Leg extractor: narrower stem kernel for sharp kick/step dynamics
@@ -328,6 +383,7 @@ class AQAModel(nn.Module):
             embed_dim=embed_dim,
             dropout=dropout,
             stem_kernel_size=3,
+            temporal_type=temporal_type,
         )
 
         # Per-limb-group learned temperatures: arms and legs can have
