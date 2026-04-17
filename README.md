@@ -5,6 +5,11 @@ data (expert "shifu" vs student) and produces per-limb quality scores. The
 model uses contrastive learning with L2 distance scoring, making it
 open-set — it generalises to movements never seen during training.
 
+This repository is the **software backup** to the primary hardware AI
+component (`ultra96.py`, running on the Ultra96 FPGA). If the FPGA is
+unavailable or produces invalid results, `live_infer.py` takes over
+inference on CPU to ensure continuous operation.
+
 This document details the design choices behind every component of the AI
 pipeline: data handling, model architecture, training, inference, live
 deployment, evaluation, and calibration fine-tuning.
@@ -19,23 +24,37 @@ deployment, evaluation, and calibration fine-tuning.
 4. [Training — train.py](#training--trainpy)
 5. [Inference — infer.py](#inference--inferpy)
 6. [Live Inference — live_infer.py](#live-inference--live_inferpy)
-7. [Evaluation — eval.py](#evaluation--evalpy)
-8. [Calibration Fine-Tuning — finetune_calibration.py](#calibration-fine-tuning--finetune_calibrationpy)
+7. [Hardware AI — ultra96.py](#hardware-ai--ultra96py)
+8. [Evaluation — eval.py](#evaluation--evalpy)
+9. [Calibration Fine-Tuning — finetune_calibration.py](#calibration-fine-tuning--finetune_calibrationpy)
+10. [Classical ML Fallback — train_dtw.py](#classical-ml-fallback--train_dtwpy)
+11. [Debug Utility — mqtt_reader.py](#debug-utility--mqtt_readerpy)
 
 ---
 
 ## System Overview
-
-> **Note:** This model serves as a software backup to the hardware AI
-> component. If the hardware AI (running on the Ultra96 FPGA) is
-> unavailable or produces invalid results, this software implementation
-> takes over inference to ensure continuous operation.
 
 The system assesses how well a student performs a martial arts movement
 compared to an expert ("shifu"). Eight IMU sensors (4 limbs x 2 segments
 each) capture accelerometer and gyroscope data at each timestep, producing
 48 channels of motion data. The AI compares the student's motion pattern
 against the expert's and outputs per-limb quality scores in [0, 1].
+
+**Deployment architecture:**
+
+```
+Ultra96 FPGA — ultra96.py (primary, hardware-accelerated)
+    │
+    └─ falls back to ──► live_infer.py (software backup, CPU)
+                              │
+                              └─ offline replay ──► infer.py (file-based, debug)
+```
+
+The hardware AI (`ultra96.py`) runs directly on the Ultra96 FPGA via
+memory-mapped I/O, loading the bitfile `siamese_lstm.bit`. The software
+backup (`live_infer.py`) subscribes to the same MQTT topics and publishes
+to the same `inference/result` topic, so downstream consumers see no
+difference if the FPGA is swapped out.
 
 The system has two views worth drawing: the **Siamese data flow** (how
 the two streams meet and produce scores) and the **FeatureExtractor
@@ -95,7 +114,9 @@ Siamese side — twice as `arm_extractor`, twice as `leg_extractor`):
                   with skip connection (x + block(x))
       │
       ▼
-  Bi-LSTM  (hidden=8, 1 layer, bidirectional)
+  Temporal aggregator (architecture-dependent — see below):
+    • "original" model → Bi-LSTM  (hidden=8, 1 layer, bidirectional)
+    • "slim" model     → Dilated Conv1d  (k=3, dilation=1 then dilation=2)
       │
       ▼
   Pooling over time:
@@ -229,6 +250,27 @@ learn the underlying motion pattern.
 
 ## Model Architecture — aqa_model.py
 
+### Dual Architecture: Original vs Slim
+
+The codebase supports two temporal aggregator variants, selectable via
+`--model_type` at training time or auto-detected from checkpoint keys at
+inference time:
+
+| Aspect | `"original"` | `"slim"` |
+|---|---|---|
+| Temporal aggregator | Bi-LSTM (hidden=8, bidirectional) | Dilated Conv1d (k=3, dilation 1 then 2) |
+| Parallelism | Sequential over time | Fully parallel |
+| CPU latency | Higher | Lower |
+| Checkpoint key | `arm_extractor.lstm.*` | `arm_extractor.temporal.*` |
+
+The slim variant was introduced to reduce inference latency on CPU (the
+software backup path). The FPGA (`ultra96.py`) runs the LSTM variant in
+hardware.
+
+`detect_model_type()` inspects checkpoint keys at load time and
+automatically selects the correct `MODEL_CONFIGS` entry, so `infer.py`
+and `live_infer.py` handle both architectures without flags.
+
 ### Why Siamese?
 
 A Siamese architecture processes the reference and student through the
@@ -256,8 +298,8 @@ The model uses two independent `FeatureExtractor` instances with different
 stem kernel sizes:
 
 ```
-arm_extractor: stem Conv1d(12, 32, kernel_size=7) → 2x ResBlock1D → Bi-LSTM → Pooling
-leg_extractor: stem Conv1d(12, 32, kernel_size=3) → 2x ResBlock1D → Bi-LSTM → Pooling
+arm_extractor: stem Conv1d(12, 32, kernel_size=7) → 2x ResBlock1D → temporal aggregator → Pooling
+leg_extractor: stem Conv1d(12, 32, kernel_size=3) → 2x ResBlock1D → temporal aggregator → Pooling
 ```
 
 *Why separate extractors?* Arms and legs have fundamentally different
@@ -295,11 +337,19 @@ which is relatively aggressive for a small model. Pre-activation
 (BN-ReLU before Conv) rather than post-activation gives better gradient
 flow in practice.
 
-**3. Bi-LSTM.** A single-layer bidirectional LSTM (hidden=8, output
-dim=16). Captures temporal dependencies in both directions — the quality
-of a follow-through depends on the preceding motion, and vice versa.
-The LSTM is deliberately small (8 hidden units) to prevent overfitting
-on the limited training data.
+**3. Temporal aggregator.** Architecture-dependent:
+
+- **Original — Bi-LSTM.** A single-layer bidirectional LSTM (hidden=8,
+  output dim=16). Captures temporal dependencies in both directions — the
+  quality of a follow-through depends on the preceding motion, and vice
+  versa. The LSTM is deliberately small (8 hidden units) to prevent
+  overfitting on the limited training data.
+
+- **Slim — Dilated Conv1d.** Two stacked Conv1d layers (k=3) with
+  dilation 1 and dilation 2, applied in parallel over the time axis.
+  Produces the same output dimension (16) as the LSTM but with no
+  sequential dependency, making it significantly faster on CPU. This is
+  the preferred architecture for the software backup path.
 
 **4. Dual-mode pooling.** This is one of the most important design
 choices:
@@ -521,6 +571,14 @@ total, so the LR typically drops 1-2 times. More aggressive scheduling
 small dataset, likely because the model needs sustained gradient signal
 to calibrate the temperatures.
 
+### Model Type Selection
+
+Pass `--model_type slim` or `--model_type original` (default: `original`)
+to select which temporal aggregator to train. The slim model trains
+identically to the original — only the `FeatureExtractor` internals
+differ. Both checkpoint formats are handled transparently by `infer.py`
+and `live_infer.py` via `detect_model_type()`.
+
 ### Validation Strategy
 
 The dataset is split 80/20 by shuffled indices (seeded for
@@ -613,6 +671,14 @@ needing an MQTT connection.
 
 ## Live Inference — live_infer.py
 
+### Role in the System
+
+`live_infer.py` is the **software backup** to `ultra96.py`. It subscribes
+to the same MQTT sensor topics and publishes to the same result topics.
+When the FPGA is healthy, `ultra96.py` runs exclusively. When the FPGA
+is unavailable, `live_infer.py` provides seamless continuity on CPU using
+the same PyTorch model.
+
 ### MQTT Integration
 
 The live system subscribes to `sensor/+/aggregated` (wildcard matching
@@ -673,6 +739,15 @@ point are dominated by the zero-padding rather than real motion data,
 producing unreliable scores. 20 frames (~1 second at 20Hz) provides
 enough real signal for a meaningful first score.
 
+### Async Worker Thread
+
+A single-slot mailbox pattern decouples MQTT message receipt from
+inference computation. The MQTT callback deposits the latest frame into
+the mailbox and returns immediately; a separate worker thread consumes
+the mailbox and runs inference. If inference takes longer than the
+inter-frame interval (50ms at 20Hz), frames accumulate in the mailbox
+rather than blocking the MQTT receive loop.
+
 ### Result Publishing
 
 Results are published to two topic patterns:
@@ -694,6 +769,45 @@ incoming frame to timestamped CSVs in `live_recordings/`. Timestamps are
 relative to session start (milliseconds). This creates recordings in the
 exact same format as the training data, enabling later offline replay
 via `infer.py` or incorporation into the training set.
+
+---
+
+## Hardware AI — ultra96.py
+
+`ultra96.py` is the **primary** inference component. It runs on the
+Ultra96 FPGA board and accesses the synthesised Siamese network directly
+via memory-mapped I/O.
+
+### FPGA Communication
+
+The FPGA exposes three physical memory regions:
+
+| Region | Address | Purpose |
+|---|---|---|
+| SEQ1_PHYS | 0x70000000 | Shifu input buffer |
+| SEQ2_PHYS | 0x70100000 | Student input buffer |
+| RESULT_PHYS | 0x70200000 | Output scores |
+
+Input sequences are written directly to these addresses via `/dev/mem`
+mmap. The FPGA processes both streams and writes 9 output values to
+RESULT_PHYS: 4 limb scores, 4 node-level scores, and the overall score.
+
+The bitfile `siamese_lstm.bit` (loaded from `/home/xilinx/`) implements
+the LSTM variant of the Siamese network in hardware.
+
+### Window and Cadence
+
+The FPGA operates on 50-frame windows (1 second at 50Hz) and requires
+a minimum of 20 frames before first inference — matching the software
+backup's `MIN_FRAMES` constant so that the two systems produce
+comparable first-score timing.
+
+### Missing Sensor Handling
+
+A node mask bitmask is written alongside the input data. Nodes flagged
+as missing are zeroed in the hardware pipeline, mirroring the software
+backup's zero-fill strategy so that both systems handle partial sensor
+failures identically.
 
 ---
 
@@ -866,3 +980,49 @@ so it can be consumed by `live_infer.py`, `infer.py`, and `eval.py`
 without code changes. A `finetune` provenance dict is added (source
 checkpoint, recordings dir, old/new τ values) so you can trace the lineage
 of deployed models.
+
+---
+
+## Classical ML Fallback — train_dtw.py
+
+`train_dtw.py` is a standalone classical ML pipeline that can replace the
+neural model entirely. It requires no GPU and no PyTorch — useful for
+environments where the neural model cannot run.
+
+### Approach
+
+For each shifu-student pair, per-limb Dynamic Time Warping (DTW) distances
+are computed using `fastdtw` with Euclidean metric. The 4 resulting DTW
+distances are used as features for a supervised regressor:
+
+- **RandomForest** (default) — interpretable, outputs feature importances
+  showing which limb DTW distances matter most for overall quality
+- **SVR** — alternative for smoother score regression
+
+The same pairing strategy as the neural model is used (pseudo-shifu
+references, synthetic mismatches), and the same two-stage normalisation
+is applied before DTW computation.
+
+### When to use
+
+- No GPU available and CPU inference of the neural model is too slow
+- Rapid prototyping without training a neural model
+- Sanity check: if DTW MAE is much worse than the neural model, the
+  neural model's learned features are adding real value
+
+---
+
+## Debug Utility — mqtt_reader.py
+
+`mqtt_reader.py` connects to the MQTT broker and prints incoming sensor
+messages. It has no model dependencies and is used to verify that sensors
+are publishing correctly before starting inference.
+
+```
+python mqtt_reader.py [--raw]
+```
+
+`--raw` dumps full JSON payloads; without it, a compact per-frame summary
+is printed. Useful for checking `NODE_ORDER` alignment and confirming that
+the broker connection and TLS certificate are healthy before starting
+`ultra96.py` or `live_infer.py`.
